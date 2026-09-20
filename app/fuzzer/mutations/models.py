@@ -49,6 +49,13 @@ class MutationType(str, Enum):
     EMPTY_ARRAY = "empty_array"
     ARRAY_BOUNDARY = "array_boundary"
     OBJECT_EMPTY = "object_empty"
+    # LLM-origin (Phase 6/generator): a catch-all category for anything
+    # an LLM proposed. The model's own free-text label (if it gave one,
+    # e.g. "semantic_boundary") is preserved separately as rationale
+    # metadata on MutatedTestCase/MutationResult — this enum stays a
+    # small, closed, deterministic vocabulary; it doesn't grow just
+    # because a model invents a new category name.
+    LLM_SUGGESTED = "llm_suggested"
 
 
 class Mutation(BaseModel):
@@ -65,11 +72,21 @@ class Mutation(BaseModel):
 
 @dataclass
 class MutatedTestCase:
-    """One mutated TestCase, tied back to the baseline it was derived from."""
+    """One mutated TestCase, tied back to the baseline it was derived
+    from. `source`/`reason`/`confidence` default to the deterministic-
+    engine shape (source="deterministic", no rationale, no confidence)
+    so every existing Phase 4 call site needs zero changes — an
+    LLM-origin candidate is the same type, just with those three fields
+    populated differently. This is what "converge into one
+    representation" (the generator phase's own core requirement) means
+    concretely: no separate LLM-only type anywhere downstream."""
 
     baseline_key: str  # f"{method} {path}" — matches BaselineStore's key shape
     mutation: Mutation
     test_case: TestCase
+    source: str = "deterministic"  # "deterministic" | "llm"
+    reason: Optional[str] = None  # the LLM's own rationale, when source == "llm" — test rationale, never a vulnerability claim
+    confidence: Optional[float] = None  # the LLM's own confidence, when provided — never used as severity
 
 
 class MutationConfig(BaseModel):

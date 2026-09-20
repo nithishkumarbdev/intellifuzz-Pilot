@@ -248,7 +248,119 @@ This is the source of truth for "where are we" — not the master prompt.
   `response_structure_changed` (`{email,id,is_admin,username}` →
   `{detail}`), all evidence, zero severity anywhere in the output.
 
+### Phase 6 — LLM-Assisted Intelligent Test Generation ✅
+**Numbering note:** the phase doc for this one called itself "Phase 5"
+and assumed Response Analysis hadn't been built yet (it listed that as
+a future "Phase 6" in its own architecture diagram) — it was evidently
+drafted independently of the actual Phase 5 that shipped. Content-wise
+it only depends on Phases 1–4, so nothing was blocked; this is filed
+as Phase 6 here to match what's actually in the repo.
+
+- **Two small, backward-compatible extensions to Phase 4's own types**
+  (verified: all 169 prior tests still passed unchanged after these) —
+  this is the concrete meaning of "converge into one representation":
+  `MutationType.LLM_SUGGESTED` added to the enum, and `source`
+  (default `"deterministic"`), `reason`, `confidence` added to both
+  `MutatedTestCase` and `MutationResult`. An LLM-origin mutation is the
+  *same type* flowing through the *same* execution path
+  (`app/fuzzer/mutation_runner.py`'s new shared
+  `execute_mutated_test_cases()` helper, extracted from the previously
+  inline loop in `run_mutations_for_endpoint`) — never a parallel
+  architecture.
+- `app/generator/models.py` — raw, untrusted LLM response shape
+  (`LLMGenerationResponse`, `LLMTestCandidateRaw`, `LLMEndpointEcho`),
+  `GeneratorConfig`, and bookkeeping types for what a generation pass
+  did (`CombinedGenerationResult`, `CombinedScanSummary`).
+- `app/generator/provider.py` — `LLMProvider` ABC + `ProviderError`
+  hierarchy (`ProviderTimeout`/`ProviderUnavailable`/`ProviderAuthError`);
+  `FakeLLMProvider` and `FailingLLMProvider` (test doubles, no network);
+  `OpenAICompatibleProvider` (real provider, built on `httpx` — already
+  a dependency, so no new SDK — against the OpenAI-compatible
+  chat-completions shape, which works unmodified against OpenAI itself,
+  OpenRouter, and most local model gateways).
+- `app/generator/prompt.py` — the prompt template, kept separate from
+  logic. The security-boundary system prompt is injected by the
+  provider as an actual system-role message, never concatenated into
+  the same string as untrusted context — concrete prompt-injection
+  resistance, not just a comment saying so. Also holds
+  `heuristic_offline_response()`: a fully offline, deterministic
+  "model" that reads back the same JSON context block the prompt
+  embeds and proposes plausible, endpoint-aware candidates — this is
+  what makes `LLM_PROVIDER=fake` genuinely useful for demos/CI rather
+  than just returning nothing.
+- `app/generator/context.py` — builds the per-endpoint LLM context.
+  Deliberately excludes `.headers` entirely (so a real auth token value
+  can never reach a prompt) and excludes every other endpoint (token
+  cost control + keeps "only propose tests for the endpoint you were
+  asked about" enforceable).
+- `app/generator/candidates.py` — parsing (never raises; malformed
+  JSON or schema mismatch becomes `(None, error_string)`) and
+  validation (the actual security boundary). The model's *echoed*
+  endpoint must match the endpoint actually queried, or the entire
+  batch is rejected outright — the concrete defense against a
+  prompt-injection attempt hidden in OpenAPI description text trying to
+  redirect candidates elsewhere; the model's self-report is checked,
+  never trusted. `target_location` must resolve to a real field on
+  *this* endpoint (`unknown_field`); only `path`/`query`/`body` kinds
+  are accepted, never `header` (`unsupported_location_kind`). Value
+  TYPE mismatches are explicitly NOT rejected — a string proposed for
+  an integer field is often exactly the interesting test.
+- `app/generator/config.py` — `LLMSettings` (env-driven:
+  `LLM_PROVIDER`/`LLM_MODEL`/`LLM_API_KEY`/`LLM_BASE_URL`/
+  `LLM_TIMEOUT_SECONDS`), `build_provider()`. The core "LLM is
+  optional" contract lives here concretely: a real provider requested
+  without an API key returns `None`, never raises — verified by a test.
+- `app/generator/pipeline.py` — `deduplicate_against()` (stable key:
+  endpoint + location + JSON-normalized value; removes LLM duplicates
+  of deterministic mutations AND duplicates among LLM candidates
+  themselves, order-preserving); `generate_combined_mutations()` (one
+  endpoint: deterministic + validated/deduped LLM, any LLM failure at
+  any stage degrades to deterministic-only and records why, never
+  raises); `run_combined_fuzzing_pass()` (whole-spec orchestration,
+  adds `generator_config.max_total_llm_calls` as a budget on top of
+  Phase 4's existing `max_total_mutations`/`skip_methods` — once the
+  LLM budget is spent, remaining endpoints still get full deterministic
+  treatment).
+- 71 new tests: provider contract (12, including a real HTTP-mocked
+  `OpenAICompatibleProvider` — no real network, no real key), prompt +
+  heuristic offline response (9), context/secret-exclusion (7),
+  candidate parsing + every validation/security-boundary path (19),
+  dedup + combined generation (13), settings/optional-LLM contract (7),
+  full live end-to-end (4, including "budget exhausted mid-run still
+  fuzzes deterministically" and "failing provider never stops the
+  overall scan"). Full suite now **240 passing**.
+- `examples/demo_llm_fuzz.py` — offline by default
+  (`LLM_PROVIDER=fake`), same env vars swap in a real provider. Live
+  run: 128 deterministic + 14 LLM-accepted (0 rejected — the offline
+  heuristic only proposes real field names) = 142 executed. Notably,
+  one LLM candidate (`GET /slow`'s `query.delay -> 999`) came back as a
+  clean `ERROR(timeout)` rather than hanging — the runner's timeout
+  protection (established in Phase 4) working correctly for an
+  LLM-suggested value it had never seen before, not just
+  deterministic ones.
+- `README.md` created (didn't exist before this phase, despite being
+  asked for back in the very first phase doc) — project overview,
+  architecture, how to run, current status.
+
 ## Known gaps (not blocking, tracked for later phases)
+- Only one real LLM provider implemented (OpenAI-compatible, via raw
+  `httpx`) — genuinely covers OpenAI/OpenRouter/most local gateways in
+  practice, but a native Anthropic Messages-API provider (different
+  request shape) isn't implemented. Adding one is a small, additive
+  change against the same `LLMProvider` interface — not attempted here
+  per "at least one real provider" being the phase's actual requirement.
+- The LLM generator only targets path/query/body locations, same as
+  Phase 4's deterministic engine — no header-value fuzzing (e.g.
+  proposing a mutated auth token). Consistent, deliberate scope
+  boundary across both generators, not an oversight specific to this
+  phase.
+- `generate_combined_mutations` makes exactly one LLM call per endpoint
+  (matching "one call can generate several candidate tests rather than
+  one call per field" from the phase spec) — there's no retry-with-
+  feedback loop (e.g. re-prompting after a validation rejection to ask
+  for a corrected candidate). Simple and predictable; revisit only if a
+  real provider's rejection rate in practice turns out to be high
+  enough to matter.
 - Parser only follows local `$ref`s (no external file refs) — fine for V1 scope.
 - `FieldSchema` covers a practical JSON Schema subset (no `allOf`, no nested
   array item schemas yet) — will extend if a later phase's mutator needs more.
@@ -326,15 +438,16 @@ This is the source of truth for "where are we" — not the master prompt.
   produce a flaky, order-dependent failure.)
 
 ## Next
-### Phase 6 — Deterministic Security Rules (most likely next)
-Per the architecture diagram in the Phase 5 doc itself (Response Analysis
-→ Deterministic Rules → Security Findings), the next logical step is a
-rules engine that interprets `AnalysisResult`/`Anomaly` evidence into
-actual findings with severity — the first point anywhere in this project
-where a severity label is assigned. Deterministic rules only (e.g. "a
-mutation-caused 5xx with a matched error signature is at least Medium");
-LLM-assisted test generation (proposing adversarial cases the
-deterministic mutation engine wouldn't think of, still gated by the same
-validation layer, still no role in judging results) remains a separate,
-not-yet-scheduled branch per the diagram. Actual next-phase scope is
-whatever the next phase doc specifies.
+### Phase 7 — Deterministic Security Rules & Finding Classification (most likely next)
+Now that both generation paths (deterministic mutation + LLM-assisted)
+converge into one execution stream, and Phase 5's analyzer already turns
+raw results into structured `AnalysisResult`/`Anomaly` evidence, the
+remaining piece before this becomes a genuine security tool is a rules
+engine that interprets that evidence into actual `Finding`s with real
+severity — the first point anywhere in this project where a severity
+label gets assigned. Deterministic rules only (e.g. "a mutation-caused
+5xx with a matched error signature is at least Medium"); `source`
+(deterministic vs llm) and `reason`/`confidence` are already carried all
+the way through to this point, so rules can factor in provenance without
+any further plumbing. Actual next-phase scope is whatever the next phase
+doc specifies.
