@@ -37,11 +37,14 @@ def test_discovers_all_endpoints(parsed_vuln_api):
     assert ("/admin/stats", "GET") in paths_and_methods
     assert ("/orders", "POST") in paths_and_methods
     assert ("/orders/{order_id}", "GET") in paths_and_methods
-    # vulnerable-api grew in Phase 2 (PUT/PATCH/DELETE on /users/{user_id},
-    # plus /slow, /text, /echo test-scaffolding endpoints) — 17 operations
-    # total. The exact number matters less than proving the parser finds
-    # every operation, not just GETs or just the original Phase 1 set.
-    assert parsed_vuln_api.endpoint_count() == 17
+    # vulnerable-api grew across Phase 2 (PUT/PATCH/DELETE on
+    # /users/{user_id}, plus /slow, /text, /echo test-scaffolding
+    # endpoints) and Phase 4 (PUT /users/{user_id}/tags, added to give
+    # the mutation engine a real array/object body field to exercise) —
+    # 18 operations total. The exact number matters less than proving
+    # the parser finds every operation, not just GETs or just the
+    # original Phase 1 set.
+    assert parsed_vuln_api.endpoint_count() == 18
 
 
 def test_extracts_path_parameters(parsed_vuln_api):

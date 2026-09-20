@@ -61,6 +61,11 @@ class UserUpdate(BaseModel):
     age: Optional[int] = None
 
 
+class UserTagsUpdate(BaseModel):
+    tags: list[str] = []
+    metadata: dict = {}
+
+
 class OrderCreate(BaseModel):
     item: str
     amount: float
@@ -180,6 +185,27 @@ def delete_user(user_id: int, x_api_token: Optional[str] = Header(default=None))
 
     del USERS[user_id]
     return None
+
+
+# ---------------------------------------------------------------------------
+# Added in Phase 4: pure test scaffolding, not a new vulnerability class.
+# Our other body schemas (UserCreate, UserUpdate, LoginRequest, OrderCreate)
+# are all flat strings/ints, so there was nothing for the mutation engine's
+# array/object mutations to genuinely exercise end-to-end. This endpoint
+# gives the fuzzer a real array field (`tags`) and a real object field
+# (`metadata`) to mutate against a live target.
+# ---------------------------------------------------------------------------
+@app.put("/users/{user_id}/tags")
+def update_user_tags(user_id: int, payload: UserTagsUpdate, x_api_token: Optional[str] = Header(default=None)):
+    caller_id = get_current_user_id(x_api_token)
+    if caller_id is None:
+        raise HTTPException(status_code=401, detail="Missing or invalid token")
+    if user_id not in USERS:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    USERS[user_id]["tags"] = payload.tags
+    USERS[user_id]["metadata"] = payload.metadata
+    return USERS[user_id]
 
 
 # ---------------------------------------------------------------------------

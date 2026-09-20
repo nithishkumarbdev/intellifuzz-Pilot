@@ -105,6 +105,149 @@ This is the source of truth for "where are we" — not the master prompt.
   generation has no way to know real seeded order IDs are 101/102, not 1
   (documented in Known gaps, not silently ignored).
 
+### Phase 4 — Deterministic Fuzzing & Mutation Engine ✅
+- `app/fuzzer/mutations/models.py` — `MutationType` (20 kinds across
+  string/number/boolean/null/enum/array/object/structural categories),
+  `Mutation` (metadata: type, location, field_name, original/mutated
+  value), `MutatedTestCase` (mutation + resulting `TestCase`, tied to
+  `baseline_key`), `MutationConfig` (`max_mutations_per_field=8`,
+  `max_mutations_per_endpoint=40`, `max_total_mutations=500`,
+  `long_string_length=500`, `skip_methods` for excluding e.g. `DELETE`
+  from a run entirely).
+- `app/fuzzer/mutations/value_mutations.py` — per-type deterministic
+  mutators (string/integer/number/boolean/array/object) plus universal
+  enum and null handling. Fixed, documented ordering; truncated to
+  `max_mutations_per_field` from the end (never random sampling), so
+  generation is fully deterministic — verified by an explicit
+  determinism test (run twice, compare).
+- `app/fuzzer/mutations/engine.py` — `generate_mutations_for_test_case()`
+  walks an `Endpoint`'s path params, query params, and body fields,
+  producing one mutation per logical field change. Pure generation only
+  — no I/O, no result interpretation. Key design decision: mutates
+  *all* declared fields, not just the ones Phase 3's baseline happened
+  to include (baseline only fills required fields) — synthesizing a
+  valid starting value via `generate_valid_value()` for any optional
+  field the baseline omitted. Without this, `PATCH /users/{user_id}`
+  (whose `UserUpdate` fields are *all* optional) would get zero body
+  mutations, which would be a real gap for exactly the kind of endpoint
+  (partial update) worth fuzzing most.
+- `app/fuzzer/mutation_runner.py` — `run_mutations_for_endpoint()` and
+  `run_fuzzing_pass()`: execution orchestration, wiring the engine's
+  output to the existing (unmodified) `execute_test_case()`. Enforces
+  `max_total_mutations` and `skip_methods` across a whole spec;
+  endpoints whose baseline never executed are skipped (nothing
+  meaningful to mutate from). `MutationResult` makes no vulnerability
+  judgment — pure evidence, exactly per the phase's core principle.
+- `vulnerable-api/app/main.py` — added `PUT /users/{user_id}/tags`
+  (fields: `tags: list[str]`, `metadata: dict`) purely so the mutation
+  engine's array/object mutations have a real target to exercise
+  end-to-end; our other body schemas were all flat strings/ints.
+- **Found and fixed a real near-infinite-hang bug while building the
+  integration tests** (not a test bug — a genuine architectural gap):
+  a numeric mutation with no declared bounds can produce a large value
+  (999,999,999); executed against `/slow`'s `await asyncio.sleep(delay)`,
+  that's a ~31-year hang. Combined with `ASGITransport` not enforcing
+  httpx's client timeout (established in Phase 2), this hung a test past
+  any reasonable limit. Root cause, not just the symptom: any
+  timeout-dependent correctness (this, and Phase 2's original
+  timeout/connection-error tests) requires a *real* socket — ASGITransport
+  is fast and deterministic for request-construction correctness, but
+  provides no timeout protection at all. Fixed by using the real
+  live-server fixture (with a short configured timeout) for any test that
+  runs mutations across the full spec; `/slow`'s own baseline capture then
+  legitimately times out and is excluded before any mutation is attempted
+  against it, via the same "skip endpoints with a failed baseline" logic
+  already in `run_fuzzing_pass`. No special-casing of `/slow` needed.
+  Documented in `tests/test_mutation_runner.py`.
+- 40 new tests (21 value-mutators + 12 engine + 7 execution/integration,
+  including the required end-to-end OpenAPI → baseline → mutation →
+  runner → results test), full suite now **113 passing**.
+- `examples/demo_fuzz.py` — full deterministic fuzzing pass against a
+  live vulnerable-api: 18 endpoints, 128 mutations executed across 9
+  endpoints with usable baselines, JSON report saved. Confirms two
+  things live: `POST /users`'s `age=-1` mutation returns 201 (accepted —
+  ties back to VULN #2, weak input validation; Phase 4 makes no
+  vulnerability claim, just records the evidence), and `/slow`'s
+  large-delay mutation comes back as a clean timeout `ErrorInfo` rather
+  than hanging the demo.
+
+### Phase 5 — Response Analysis & Anomaly Detection ✅
+- `app/analyzer/models.py` — `AnomalyType` (12 kinds, matching the
+  phase spec's own vocabulary exactly: status_changed,
+  unexpected_server_error, unexpected_client_error,
+  authentication_behavior_changed, redirect_changed,
+  response_body_changed, response_structure_changed,
+  response_size_changed, timing_anomaly, error_signature_detected,
+  request_timeout, network_error), `StatusCategory` (1xx-5xx +
+  timeout/network_error/unknown), `Anomaly` (type + evidence dict —
+  facts only, never raw response bodies, so analysis output can't
+  become a secret-leak mechanism), `AnalysisConfig`
+  (`min_time_difference_ms=200`, `min_time_multiplier=3.0`,
+  `min_body_size_difference_bytes=10`), `AnalysisResult` (every
+  `*_changed` boolean corresponds 1:1 to whether a matching `Anomaly`
+  was appended — no field ever disagrees with the evidence list).
+  **No severity, no confidence score, anywhere in this model** — by
+  design, not omission.
+- `app/analyzer/signatures.py` — 8-entry, case-insensitive, explicitly
+  conservative error-signature list (Traceback, SQLException, "SQL
+  syntax", "database error", etc). Documented tradeoff: substring
+  matching means an innocuous message containing the phrase would also
+  match — that's why it's evidence, never a verdict.
+- `app/analyzer/analyzer.py` — `analyze()`: pure comparison, no I/O.
+  Status analysis (category shifts, auth-status transitions in EITHER
+  direction, redirects, network errors/timeouts as first-class
+  observations rather than failures); timing analysis (anomaly requires
+  BOTH the absolute-ms and ratio thresholds to clear — rejects "51ms vs
+  48ms" and "1ms vs 5ms" alike, per the phase's own examples); body
+  analysis (size/structure/generic-change, layered so the same
+  underlying diff isn't reported three times); error-signature scan
+  that only flags signatures NEW relative to the baseline (an endpoint
+  that legitimately echoes "error" in its own normal output isn't
+  evidence of anything). Explicit design note in the module docstring:
+  a status-category shift is recorded as an observation regardless of
+  whether it was actually the *correct* response for that mutation
+  (e.g. a required field removed SHOULD 422) — deciding "expected vs
+  suspicious" is later phases' job, which have the mutation type
+  available to make that call.
+- `app/analyzer/pipeline.py` — `analyze_fuzzing_results()`: wires
+  `BaselineStore` + `run_fuzzing_pass()`'s output into
+  `dict[str, list[AnalysisResult]]`. No new execution.
+- `app/fuzzer/mutation_runner.py` — added `MutationResult.from_dict()`
+  (symmetric with the existing `to_dict()`, matching `Baseline`'s own
+  established pattern), needed for the demo's save-then-reload step.
+- **Hit the exact same `/slow`-hang bug from Phase 4 again, in a new
+  test file** — a useful confirmation that the fix belongs in "how you
+  test," not something that could be patched once and forgotten:
+  `capture_baselines` via `asgi_client` lets `/slow`'s baseline succeed
+  (ASGITransport still executes the real 2s `asyncio.sleep`, it just
+  doesn't enforce httpx's timeout around it), so a later mutation still
+  generates `delay=999999999` and hangs. Fixed the same way — real
+  live-server fixture with a short timeout for any full-spec test, so
+  `/slow`'s baseline times out and is excluded before mutation.
+- **Also caught a flawed test premise before it became a false "bug":**
+  an early version of the determinism test ran the *entire* pipeline
+  twice against the same live (stateful) server and expected identical
+  results — but Phase 4's mutations genuinely change server-side state
+  (PUT/PATCH modify real user records), so two full runs against one
+  stateful target are NOT expected to match; that's the already-
+  documented state-isolation limitation, not a determinism bug.
+  Rewrote the test to state the real claim precisely: given the SAME
+  already-captured data, `analyze_fuzzing_results` is deterministic —
+  which is what the phase actually requires and is true.
+- 56 new tests (7 signatures + 19 status/category/auth/redirect + 8
+  timing + 12 body/structure/size + 7 integration-level `analyze()`
+  tests including the phase doc's three worked examples verified
+  exactly + 3 end-to-end pipeline tests), full suite now **169 passing**.
+- `examples/demo_analysis.py` — captures baselines + runs a fuzzing
+  pass live, saves both to JSON, **reloads them from disk**, then
+  analyzes the reloaded data (proving the analyzer works from persisted
+  data, not just same-process objects). Live run: 123 mutations across
+  8 endpoints, 105 produced at least one observation — e.g.
+  `GET /users/{user_id}` with `user_id=0` shows `status_changed` +
+  `unexpected_client_error` (200→404) + `response_size_changed` +
+  `response_structure_changed` (`{email,id,is_admin,username}` →
+  `{detail}`), all evidence, zero severity anywhere in the output.
+
 ## Known gaps (not blocking, tracked for later phases)
 - Parser only follows local `$ref`s (no external file refs) — fine for V1 scope.
 - `FieldSchema` covers a practical JSON Schema subset (no `allOf`, no nested
@@ -115,6 +258,50 @@ This is the source of truth for "where are we" — not the master prompt.
   from the spec" principle; will revisit if Phase 4+ needs more.
 - No retries (intentional — state-changing requests + reproducibility).
 - No concurrency yet (intentional — correctness first, per spec).
+- **Array/object mutation is shallow, not recursive.** `FieldSchema` has
+  no `items` sub-schema for arrays or `properties` for nested objects
+  (a Phase 1 limitation, not new to Phase 4), so array mutations use
+  generic placeholder elements rather than type-correct ones, and object
+  mutations only operate at the whole-field level (null/empty/wrong
+  type), never reaching into sub-properties. None of our own
+  vulnerable-api's fields currently need more than this. Extending the
+  parser to carry nested schemas is real, bounded future work if a
+  target ever needs it.
+- **Header mutation is out of scope for Phase 4** — the phase's own
+  spec only calls out path/query/body mutation categories, not headers.
+  Auth-header-specific fuzzing is a natural fit for a later
+  authentication-testing phase rather than the generic mutation engine.
+- **Timeout-dependent correctness requires a real socket, not
+  ASGITransport.** This was already true from Phase 2 but Phase 4 hit it
+  directly: a numeric mutation with no declared bounds can produce a
+  large value, and if that value drives something like a sleep/delay
+  parameter, only a real client's real timeout can cut it off gracefully.
+  Tests that run mutations across the full spec now use the live-server
+  fixture specifically because of this — see `tests/test_mutation_runner.py`
+  for the full story. This is a general risk of fuzzing: an unbounded
+  numeric mutation is safe for most fields but not guaranteed safe for
+  all of them, since the fuzzer doesn't know what a given field
+  controls. The runner's configurable timeout is the actual safety net
+  in a real (non-test) run — always use a real client with a sane
+  timeout when fuzzing a real target.
+- **Single-baseline comparison only** — the analyzer compares against
+  one captured baseline result, not multiple runs. An endpoint with a
+  genuinely unstable baseline (flaky/non-deterministic target) could
+  produce a `status_changed` observation that's really just baseline
+  noise, not something the mutation caused. `BaselineStore` only stores
+  one `Baseline` per endpoint (a Phase 3 design choice), so this
+  analyzer works with what's available rather than requiring a redesign;
+  representing multiple baseline runs (and analyzing against, say, their
+  most common result) is real future work if a target turns out to need
+  it, not attempted here per "extend only where necessary."
+- **The `UNEXPECTED_CLIENT_ERROR` / `UNEXPECTED_SERVER_ERROR` labels are
+  purely categorical, not judgments.** A status-category shift into 4xx
+  or 5xx is labeled that way even when it's exactly the CORRECT response
+  (e.g. a required field removed should 422) — deliberately, since
+  distinguishing "expected" from "suspicious" requires knowing the
+  mutation type's intent, which belongs to the security-rules phase, not
+  this one. Documented explicitly in `app/analyzer/analyzer.py`'s module
+  docstring so it isn't mistaken for an oversight later.
 - **Baseline value generation has no semantic knowledge of the target's
   actual data.** It's purely schema-driven (type/format/bounds), so an
   integer ID defaults to `1` regardless of what IDs actually exist —
@@ -139,10 +326,15 @@ This is the source of truth for "where are we" — not the master prompt.
   produce a flaky, order-dependent failure.)
 
 ## Next
-### Phase 4 — Deterministic Fuzzing (Mutation Engine)
-Take a baseline `TestCase` and systematically produce mutated variants —
-nulls, empty values, wrong types, boundary numbers, long strings, missing
-required fields, unexpected extra fields — run each through the runner,
-and keep the result alongside its baseline for comparison. Still no LLM
-here; this proves the fuzzing engine works on its own first, per the
-project's own phase ordering.
+### Phase 6 — Deterministic Security Rules (most likely next)
+Per the architecture diagram in the Phase 5 doc itself (Response Analysis
+→ Deterministic Rules → Security Findings), the next logical step is a
+rules engine that interprets `AnalysisResult`/`Anomaly` evidence into
+actual findings with severity — the first point anywhere in this project
+where a severity label is assigned. Deterministic rules only (e.g. "a
+mutation-caused 5xx with a matched error signature is at least Medium");
+LLM-assisted test generation (proposing adversarial cases the
+deterministic mutation engine wouldn't think of, still gated by the same
+validation layer, still no role in judging results) remains a separate,
+not-yet-scheduled branch per the diagram. Actual next-phase scope is
+whatever the next phase doc specifies.
