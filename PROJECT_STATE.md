@@ -342,7 +342,132 @@ as Phase 6 here to match what's actually in the repo.
   asked for back in the very first phase doc) — project overview,
   architecture, how to run, current status.
 
+### Phase 7 — Deterministic Security Rules & Finding Classification ✅
+The first phase anywhere in this project that assigns an actual
+severity. Project renamed "IntelliFuzz" in this phase's own doc — no
+functional change, just adopted the name going forward.
+
+- `app/rules/models.py` — `Severity` (INFO/LOW/MEDIUM/HIGH — no numeric
+  score), `Confidence` (LOW/MEDIUM/HIGH, kept strictly separate from
+  severity — a HIGH-severity/LOW-confidence finding is a normal, valid
+  combination, not a contradiction), `FindingCategory`, `Evidence`
+  (structural facts only — status codes, sizes, matched pattern names —
+  never a raw response body or a secret's actual value), `Reproduction`
+  (built directly from the runner's own already-masked `RequestEcho`,
+  no re-masking logic duplicated), `Finding` (the full traceability
+  chain: endpoint → baseline → mutation → mutated request → response →
+  rule, exactly as required).
+- `app/rules/rule.py` — `SecurityRule` ABC (`evaluate(context) ->
+  Optional[Finding]`) and `RuleContext`, which deliberately carries
+  BOTH the Phase 5 `AnalysisResult` and the raw `TestResult`s together
+  (see `app/rules/pipeline.py`'s docstring for why: reproduction info
+  lives on `TestResult.request`, which `AnalysisResult` doesn't carry).
+- `app/rules/rules.py` — five rules, each keyed to evidence the project
+  actually produces, not a hypothetical vulnerability taxonomy:
+  - **INPUT-001** (baseline succeeds, mutation 5xx) — severity/confidence
+    bumped from LOW to MEDIUM when an error signature is also matched.
+  - **AUTH-001** (baseline 401/403, mutation succeeds) — reachable
+    with the *current* mutation engine's scope (a body/query/path field
+    that incorrectly influences server-side auth would trigger it) even
+    though headers aren't mutated; keyed on the status PATTERN, so it
+    would also catch a future header-mutated "token removed, still
+    succeeds" case with no new rule needed. Documented as unlikely to
+    fire against our own vulnerable-api specifically, since its auth
+    check happens before any mutated field is read — exercised via
+    hand-built contexts in tests instead.
+  - **AUTHZ-001** (path-identifier mutated, both baseline and mutation
+    succeed) — `Severity.HIGH` / `Confidence.LOW` by design: exactly
+    the "high potential impact, can't independently verify" example
+    from the phase's own spec. Demonstrated live against vulnerable-
+    api's real VULN #1 IDOR in `tests/test_rules_pipeline.py`.
+  - **DATA-001** (new, sensitive-named field appears in the response) —
+    a small (11-entry), conservative, name-only marker list; explicitly
+    never inspects or logs field *values*.
+  - **BEHAVIOR-001** (null/missing-field/type-confused value accepted
+    with success) — fired for real in the live demo: Pydantic's own
+    lenient coercion accepts a stringified number (`"1"` → `1`) where
+    stricter typing might be expected.
+  Every title starts with "Potential"; tested explicitly that none of
+  the banned confirmed-vulnerability phrasing ("confirmed", "bypass
+  confirmed") ever appears.
+- `app/rules/engine.py` — `RuleEngine` (plain list of rules, not a
+  plugin framework), `deduplicate_findings()` (keyed on endpoint +
+  rule_id + mutation location, deliberately NOT the specific mutated
+  value — `quantity=-1`, `quantity=-999`, `quantity=999999999` all
+  correctly collapse into one finding, exactly per the phase's own
+  example).
+- `app/rules/pipeline.py` — `evaluate_fuzzing_results()`. Calls Phase
+  5's `analyze()` directly (not the pre-computed
+  `analyze_fuzzing_results` output) so each `RuleContext` gets the
+  `AnalysisResult` and the original `MutationResult` (source/reason/
+  `TestResult.request`) together without an error-prone zip-by-position
+  between two separately-produced lists — additive, `app/analyzer/`
+  itself untouched.
+- **Found two more instances of the same class of bug this project
+  keeps surfacing — shared mutable state across what look like
+  independent operations:**
+  1. A live-demo/test assumption that `AUTHZ-001` would fire against a
+     *full-spec* run on `GET /users/{user_id}` was wrong: baseline
+     capture's own `DELETE /users/{user_id}` baseline call (which runs
+     regardless of the *fuzzing* pass's `skip_methods`) really deletes
+     user 1 before the fuzzing pass even starts, so every mutation
+     against that endpoint 404s regardless of the mutated id. Not a
+     rule bug — verified live, then fixed the test/demo's expectations
+     rather than the (already-documented, deliberately unsolved since
+     Phase 3) baseline-capture limitation.
+  2. Building a *targeted* single-endpoint test to demonstrate AUTHZ-001
+     properly hit a related, genuinely new issue: it used the shared
+     session-scoped `live_vulnerable_api_url` fixture, and an *earlier*
+     test in the same file had already run a full-spec capture against
+     that same shared server — deleting user 1 before this test even
+     started. Fixed by adding `isolated_live_vulnerable_api_url` (a
+     dedicated, function-scoped live server) to `tests/conftest.py` for
+     tests that need guaranteed-fresh seed data, alongside the existing
+     shared session-scoped one for tests that don't care.
+- 41 new tests (22 rules incl. false-positive-resistance for every
+  rule + 10 engine/dedup + 5 finding-ID determinism/serialization + 4
+  live end-to-end, including the concrete AUTHZ-001 IDOR demonstration).
+  Full suite now **281 passing**.
+- `examples/demo_findings.py` — runs the FULL pipeline (deterministic +
+  LLM via Phase 6, matching the phase's own final-architecture diagram)
+  through to findings. Live, uncurated result: 3 real `BEHAVIOR-001`
+  findings (stringified-number coercion on `/slow`, `POST /users`,
+  `POST /orders`); zero `INPUT-001`/`AUTH-001`/`DATA-001`/`AUTHZ-001`
+  this run — each absence explained above, not silently glossed over.
+- `README.md` updated: new "Anomaly vs. signal vs. finding" section
+  making the Phase 5 → Phase 7 distinction explicit, per the phase's
+  own requirement.
+
 ## Known gaps (not blocking, tracked for later phases)
+- **AUTH-001 has never fired against vulnerable-api specifically**, and
+  isn't expected to, since its auth check happens before any mutated
+  field is read — the rule is correct and tested (hand-built contexts),
+  just not exercised by this particular target's own bugs. A target
+  whose authorization logic incorrectly depends on a body/query field
+  would trigger it for real.
+- **AUTHZ-001 doesn't fire on a full-spec run against
+  `GET /users/{user_id}`** specifically, because baseline capture's own
+  `DELETE /users/{user_id}` baseline call deletes user 1 before the
+  fuzzing pass starts (documented since Phase 3, still unsolved) — every
+  mutation against that endpoint then 404s regardless of the mutated id.
+  Demonstrated working correctly via a targeted single-endpoint test
+  instead (`tests/test_rules_pipeline.py`). A future fix to baseline-
+  capture ordering (e.g. capturing read-only baselines before
+  state-changing ones) would make this reachable on a full run too.
+- **DATA-001 is name-only, not value- or type-aware** — a boolean field
+  literally named `password_reset_available` would still match. A
+  deliberate, documented tradeoff (conservative, explainable, no
+  guessing at semantics) over a "smarter" rule that would need to.
+- **No rule currently uses `RESPONSE_SIZE_CHANGED` or
+  `TIMING_ANOMALY` anomalies** (both produced by Phase 5's analyzer,
+  neither consumed by any Phase 7 rule yet) — e.g. a mutation that
+  causes a dramatically slower response could be a resource-exhaustion
+  signal worth its own rule. Left out to keep this phase's rule set
+  small and defensible rather than exhaustive, per its own instruction.
+- Deduplication is finding-level only (endpoint + rule + location) —
+  it does not attempt cross-rule correlation (e.g. recognizing that an
+  AUTH-001 and an AUTHZ-001 finding on the same endpoint might describe
+  related underlying behavior). Each rule's findings stand alone.
 - Only one real LLM provider implemented (OpenAI-compatible, via raw
   `httpx`) — genuinely covers OpenAI/OpenRouter/most local gateways in
   practice, but a native Anthropic Messages-API provider (different
@@ -438,16 +563,14 @@ as Phase 6 here to match what's actually in the repo.
   produce a flaky, order-dependent failure.)
 
 ## Next
-### Phase 7 — Deterministic Security Rules & Finding Classification (most likely next)
-Now that both generation paths (deterministic mutation + LLM-assisted)
-converge into one execution stream, and Phase 5's analyzer already turns
-raw results into structured `AnalysisResult`/`Anomaly` evidence, the
-remaining piece before this becomes a genuine security tool is a rules
-engine that interprets that evidence into actual `Finding`s with real
-severity — the first point anywhere in this project where a severity
-label gets assigned. Deterministic rules only (e.g. "a mutation-caused
-5xx with a matched error signature is at least Medium"); `source`
-(deterministic vs llm) and `reason`/`confidence` are already carried all
-the way through to this point, so rules can factor in provenance without
-any further plumbing. Actual next-phase scope is whatever the next phase
-doc specifies.
+### Phase 8 — Reporting (most likely next)
+Per the architecture diagrams both Phase 5's and Phase 7's own docs have
+consistently shown (Findings → Reports → n8n → Slack/Discord), the next
+logical step is turning the deduplicated `Finding` list into a
+human-readable report — likely both a structured JSON export (already
+mostly there via `Finding.model_dump(mode="json")`) and an HTML/Markdown
+summary suitable for sharing. `AI_NOTES.md` (documenting where AI is
+used vs. where deterministic logic decides, from the very first phase
+doc) is still outstanding too. n8n/Slack/Discord remain explicitly out
+of scope until reporting exists for them to trigger from. Actual
+next-phase scope is whatever the next phase doc specifies.
