@@ -1,7 +1,7 @@
 """
 Shared fixtures for the runner test suite.
 
-Two ways of reaching the vulnerable-api target, used for different
+Three ways of reaching the vulnerable-api target, used for different
 purposes:
 
 - `asgi_client` / `vulnerable_api_app`: a FRESH vulnerable-api app
@@ -21,8 +21,21 @@ purposes:
   behavior is required — specifically timeouts, since httpx does not
   enforce its timeout against an in-process ASGI transport (there's no
   real I/O for it to interrupt). Session-scoped deliberately: booting a
-  real server per test would be slow, and every test that uses this
-  fixture is read-only (/health, /slow), so sharing is safe here.
+  real server per test is slow, and most tests that use this fixture
+  either don't care about specific resource state or only need "alice
+  still exists at the very start" — true for the first user of the
+  fixture in a session, but NOT guaranteed for every test, since a
+  full-spec capture_baselines() call also captures DELETE
+  /users/{user_id}'s baseline as a side effect, which really deletes
+  user 1 on the shared server. A test file that ran a full-spec
+  baseline+fuzz pass and then later needed user 1 to still exist hit
+  exactly this — see test_rules_pipeline.py's own history.
+
+- `isolated_live_vulnerable_api_url`: a dedicated, function-scoped real
+  server — for tests that specifically need guaranteed-fresh seed data
+  regardless of what any other test in the same file already did.
+  Slower (boots a real server per test), used only where that
+  guarantee genuinely matters.
 """
 
 from __future__ import annotations
@@ -74,11 +87,8 @@ def _find_free_port() -> int:
         return s.getsockname()[1]
 
 
-@pytest.fixture(scope="session")
-def live_vulnerable_api_url() -> Iterator[str]:
-    # Deliberately its own app instance, not shared with the
-    # function-scoped `vulnerable_api_app` above.
-    app = _load_vulnerable_api_app()
+def _boot_live_server(app) -> Iterator[str]:
+    """Shared boot/teardown logic for both live-server fixtures below."""
     port = _find_free_port()
     config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
     server = uvicorn.Server(config)
@@ -100,6 +110,21 @@ def live_vulnerable_api_url() -> Iterator[str]:
 
     server.should_exit = True
     thread.join(timeout=5)
+
+
+@pytest.fixture(scope="session")
+def live_vulnerable_api_url() -> Iterator[str]:
+    # Deliberately its own app instance, not shared with the
+    # function-scoped `vulnerable_api_app` above.
+    yield from _boot_live_server(_load_vulnerable_api_app())
+
+
+@pytest.fixture
+def isolated_live_vulnerable_api_url() -> Iterator[str]:
+    """Function-scoped: a brand-new server + fresh seed data for this
+    one test only, unaffected by what any other test did to the shared
+    session-scoped server above."""
+    yield from _boot_live_server(_load_vulnerable_api_app())
 
 
 @pytest.fixture
