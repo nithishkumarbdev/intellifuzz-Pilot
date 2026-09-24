@@ -438,6 +438,81 @@ functional change, just adopted the name going forward.
   making the Phase 5 → Phase 7 distinction explicit, per the phase's
   own requirement.
 
+### Phase 8 — Reporting ✅
+- `app/reports/models.py` — `Report` (metadata + sorted findings —
+  ONE object every renderer reads from, per the phase's own "single
+  source of truth" requirement), `ReportMetadata` (project name,
+  report ID, generated-at timestamp, target/spec if known, severity +
+  rule counts, a fixed `disclaimer` string embedded in every format
+  including JSON, so a downstream consumer like n8n gets the same
+  honesty guarantee a human reading the Markdown/HTML gets).
+- `app/reports/formatting.py` — `sort_findings()` (severity → endpoint
+  → rule_id → finding_id, returns a NEW list, never mutates the input)
+  and `safe_excerpt()` (truncates large values rather than dumping them
+  whole — shared by both Markdown and HTML so the truncation behavior
+  can't drift between formats).
+- `app/reports/build.py` — `build_report()`: the only place metadata
+  gets computed. `generated_at` is injectable (defaults to now, UTC) —
+  same "explicit config, never a hidden global" pattern as
+  `RunnerSettings`/`MutationConfig` since Phase 2 — so tests can assert
+  exact output. Documented precisely what "deterministic" means here:
+  finding ORDERING and every other field are deterministic given the
+  same inputs; `generated_at`/`report_id` are inherently point-in-time
+  and not expected to match across separate runs.
+- `app/reports/json_reporter.py` — deliberately thin:
+  `Report.model_dump(mode="json")` + `json.dumps`. No separate
+  JSON-specific data model to keep in sync with the other two formats.
+- `app/reports/markdown_reporter.py` — summary table, per-rule counts
+  table, one section per finding (severity/confidence/rule/endpoint/
+  source, evidence, reproduction), the disclaimer always present
+  (including on an empty report).
+- `app/reports/html_reporter.py` — standalone single file, no JS
+  framework, no build step, severity-color-coded finding cards.
+  **Added HTML-escaping (`html.escape`) on every rendered value** —
+  not explicitly asked for in the phase spec, but a real, obvious gap
+  once you notice where finding data ultimately comes from: mutation
+  values, matched field names, and reproduction bodies are all derived
+  from the fuzzed target's own responses (or an LLM's proposed values)
+  — untrusted input from this report generator's point of view.
+  Rendering any of that unescaped would make the report itself an XSS
+  vector when opened in a browser. Masking (Phase 2's `RequestEcho`)
+  handles secrets; this handles the separate, previously-unaddressed
+  concern of the report becoming an injection vector. Verified with
+  explicit regression tests (`<script>` in a title/evidence-detail/
+  reproduction-body/endpoint never survives unescaped).
+- `app/reports/service.py` — `ReportService.generate()`: findings → one
+  or more files on disk in one call, unknown format names rejected
+  with a clear error, output directory created if missing.
+- `app/cli.py` — **the project's first standalone CLI**
+  (`python -m app.cli`). No prior CLI existed to extend (every earlier
+  phase was demo-script-driven), so this consolidates the same
+  building blocks each `examples/demo_*.py` already used
+  (parse → baseline → deterministic+LLM mutations → execute → analyze
+  → rules → report) into one configurable command: `--spec`, `--target`,
+  `--auth-header`/`--auth-value`, `--timeout`, `--max-mutations`,
+  `--skip-methods`, `--report-dir`, `--formats`, `--no-llm`.
+- 59 new tests (10 build/sorting + 10 JSON + 12 Markdown + 13 HTML
+  incl. 4 dedicated XSS-escaping regressions + 8 service + 6 CLI incl.
+  one live end-to-end run). Full suite now **340 passing**.
+- `examples/demo_reporting.py` — full pipeline through to all three
+  report formats, offline by default. Live, uncurated result: same 3
+  real `BEHAVIOR-001` findings as Phase 7's own demo, rendered
+  correctly and consistently across JSON/Markdown/HTML (verified: same
+  `finding_id`s appear in all three, masked header preserved in all
+  three, large bodies truncated in Markdown/HTML but not JSON since
+  JSON is the machine-readable format and truncating it would corrupt
+  data a downstream consumer might need in full).
+- `AI_NOTES.md` created — outstanding since the very first phase doc.
+  Factual, cross-references real file paths and real tests, no
+  marketing language.
+- `README.md`: architecture diagram extended through Reporting, status
+  table updated, "Anomaly vs. signal vs. finding" renamed to include
+  "vs. report" with a new paragraph, dedicated "Reporting" section, CLI
+  usage added to "Running it", repository layout updated (including an
+  explicit note that `app/reports/` — the code — and top-level
+  `reports/` — the generated output directory — are two different
+  things sharing a name, since that could otherwise confuse a reader).
+
 ## Known gaps (not blocking, tracked for later phases)
 - **AUTH-001 has never fired against vulnerable-api specifically**, and
   isn't expected to, since its auth check happens before any mutated
@@ -468,6 +543,18 @@ functional change, just adopted the name going forward.
   it does not attempt cross-rule correlation (e.g. recognizing that an
   AUTH-001 and an AUTHZ-001 finding on the same endpoint might describe
   related underlying behavior). Each rule's findings stand alone.
+- **No pagination or size cap on the HTML/Markdown report itself** — a
+  scan with hundreds of findings would produce one large (if
+  internally truncated per-field) file rather than being split or
+  paginated. Individual large VALUES are truncated (`safe_excerpt`),
+  but the overall finding COUNT isn't capped by the reporter — that's
+  `MutationConfig.max_total_mutations` and dedup's job upstream, which
+  already bound this in practice; a report genuinely produced from an
+  enormous, unbounded scan is not separately guarded against here.
+- **CLI has no dry-run/validate-only mode** — every invocation performs
+  a real scan against the real target. Fine for this project's current
+  scope (a local/authorized test target), worth revisiting before
+  pointing this at anything more sensitive.
 - Only one real LLM provider implemented (OpenAI-compatible, via raw
   `httpx`) — genuinely covers OpenAI/OpenRouter/most local gateways in
   practice, but a native Anthropic Messages-API provider (different
@@ -563,14 +650,15 @@ functional change, just adopted the name going forward.
   produce a flaky, order-dependent failure.)
 
 ## Next
-### Phase 8 — Reporting (most likely next)
-Per the architecture diagrams both Phase 5's and Phase 7's own docs have
-consistently shown (Findings → Reports → n8n → Slack/Discord), the next
-logical step is turning the deduplicated `Finding` list into a
-human-readable report — likely both a structured JSON export (already
-mostly there via `Finding.model_dump(mode="json")`) and an HTML/Markdown
-summary suitable for sharing. `AI_NOTES.md` (documenting where AI is
-used vs. where deterministic logic decides, from the very first phase
-doc) is still outstanding too. n8n/Slack/Discord remain explicitly out
-of scope until reporting exists for them to trigger from. Actual
-next-phase scope is whatever the next phase doc specifies.
+### Phase 9 — n8n Automation (most likely next)
+Per every architecture diagram from Phase 5 onward (Findings → Reports
+→ n8n → Slack/Discord), reporting was the last piece n8n needed to
+exist before it had something concrete to trigger from and consume.
+`app/cli.py` (Phase 8) is already the shape an n8n "Execute Command"
+node would call, and `security-report.json`'s stable, documented shape
+(Phase 8) is already what an n8n "Read JSON" node would parse — the
+next phase is wiring an actual n8n workflow around them: trigger scan →
+wait for completion → read the JSON report → branch on
+`severity_counts`/`total_findings` → notify. Slack/Discord alerting
+follows naturally once n8n exists to send them from. Actual next-phase
+scope is whatever the next phase doc specifies.

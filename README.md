@@ -60,7 +60,13 @@ OpenAPI / Swagger
                place severity appears)
                     │
                     ▼
-          [ next: reporting, n8n, alerts ]
+              Reporting                     (app/reports)
+              ├── JSON      (machine-readable, for n8n/CI)
+              ├── Markdown  (developer-friendly, for issues/PRs)
+              └── HTML      (standalone, human-friendly/shareable)
+                    │
+                    ▼
+          [ next: n8n, Slack/Discord alerts ]
 ```
 
 Every stage after the parser is independently testable and has run
@@ -79,17 +85,20 @@ isolation.
 | 5 | Response analysis & anomaly detection (evidence, no severity) | done |
 | 6 | LLM-assisted intelligent test generation (optional, provider-agnostic) | done |
 | 7 | Deterministic security rules & finding classification (real severity) | done |
-| 8+ | Reporting, n8n, Slack/Discord alerts | not yet |
+| 8 | Reporting — JSON, Markdown, standalone HTML | done |
+| 9+ | n8n, Slack/Discord alerts | not yet |
 
 See `PROJECT_STATE.md` for the detailed, per-phase build log — what was
 built, why, what broke along the way and how it was fixed, and honestly
 stated known limitations. That file is the real source of truth on
-"where is this project, exactly" — this README is the tour.
+"where is this project, exactly" — this README is the tour. See
+`AI_NOTES.md` for a focused, engineering-only account of exactly where
+AI is used and where it is not trusted.
 
-## Anomaly vs. signal vs. finding
+## Anomaly vs. signal vs. finding vs. report
 
-Three different, deliberately-separated concepts get easy to conflate
-in a project like this, so here's the precise distinction:
+Four different, deliberately-separated concepts get easy to conflate in
+a project like this, so here's the precise distinction:
 
 - **Anomaly** (`app/analyzer`, Phase 5) — "this specific mutation's
   result differs from the baseline in some measurable way": a status
@@ -105,15 +114,24 @@ in a project like this, so here's the precise distinction:
   pattern is real) and a `Confidence` (how sure the rule can be, kept
   strictly separate — see below) — the first place in this project
   either of those exists.
+- **Report** (`app/reports`, Phase 8) — the same `Finding` list,
+  rendered into a shareable form. All three formats (JSON, Markdown,
+  HTML) are built from one `Report` object (`app/reports/build.py`);
+  none of them computes its own copy of severity counts, ordering, or
+  finding data. A report containing zero findings does not prove the
+  API is secure — it means no findings were produced by the currently
+  implemented rules and test set, and every report says so explicitly.
 - **Confirmed vulnerability** — does not exist anywhere in this
   project's output, on purpose. Every finding's title starts with
   "Potential"; the rules are tested explicitly to make sure phrasing
-  like "confirmed" or "bypass confirmed" never appears. A `Finding` is
-  where to start an investigation, not where one ends.
+  like "confirmed" or "bypass confirmed" never appears, in the finding
+  itself or in any rendered report. A `Finding` is where to start an
+  investigation, not where one ends.
 
 Concretely: Phase 5 says *"something changed."* Phase 7 says *"this
 change matches a deterministic security-relevant pattern — here's how
-bad it could be, and here's how sure we are."* Neither says *"this is a
+bad it could be, and here's how sure we are."* Phase 8 says *"here's
+that same information, shareable."* None of them says *"this is a
 vulnerability."*
 
 `Severity` and `Confidence` are intentionally independent scales — a
@@ -121,6 +139,29 @@ vulnerability."*
 cross-resource access pattern the fuzzer cannot independently verify as
 unauthorized) is a completely normal, valid combination, not a
 contradiction.
+
+## Reporting
+
+`ReportService.generate()` (or `python -m app.cli`, see below) takes a
+`list[Finding]` and produces one or more of:
+
+- **JSON** — machine-readable, deterministic field ordering, meant to
+  be consumed by tooling (a future n8n workflow, CI, anything else)
+  without needing to understand any Python internals.
+- **Markdown** — meant to be attached to an issue, pasted into a PR
+  description, committed as a CI artifact, or read during a demo.
+- **HTML** — a single standalone file, opens directly in a browser, no
+  server or build step. Response/request data embedded in it is
+  HTML-escaped (finding data ultimately derives from the fuzzed
+  target's own responses, which this report generator treats as
+  untrusted input — the report itself must not become an XSS vector).
+
+Findings are sorted severity-first (HIGH → MEDIUM → LOW → INFO), then
+by endpoint, then rule ID, then finding ID — the same order in every
+format, so reports are easy to compare/diff run to run. Large response
+bodies are truncated (never dumped whole) in Markdown and HTML; secrets
+are never re-derived or re-masked here — every report simply renders
+whatever the already-masked `RequestEcho`/`Reproduction` data contains.
 
 ## Technology stack
 
@@ -130,7 +171,7 @@ contradiction.
   HTTP calls — no separate provider SDK)
 - **Pydantic** — schema validation throughout, including LLM output
   validation
-- **pytest** — the whole test suite (281 tests as of Phase 7)
+- **pytest** — the whole test suite (340 tests as of Phase 8)
 
 No database (JSON files are sufficient at this project's current
 scale), no Kubernetes, no message broker — deliberately. See
@@ -159,7 +200,7 @@ test — see the Security scope section below.
 pip install -r requirements.txt
 ```
 
-### 3. Run the demos
+### 3. Run the demos, or the CLI directly
 
 Each demo is self-contained and runs against the vulnerable-api started
 above:
@@ -172,18 +213,35 @@ python3 examples/demo_fuzz.py         # Phase 4: deterministic mutation + execut
 python3 examples/demo_analysis.py     # Phase 5: mutation + response analysis
 python3 examples/demo_llm_fuzz.py     # Phase 6: deterministic + LLM-assisted, offline by default
 python3 examples/demo_findings.py     # Phase 7: full pipeline through to security findings
+python3 examples/demo_reporting.py    # Phase 8: full pipeline through to JSON/Markdown/HTML reports
 ```
 
-`demo_llm_fuzz.py` and `demo_findings.py` run fully offline by default
-(`LLM_PROVIDER=fake` — a deterministic, endpoint-aware heuristic
-"model", no network, no API key). To use a real provider instead:
+Or, as of Phase 8, the same end-to-end scan via the project's one CLI
+entry point:
+
+```bash
+python3 -m app.cli \
+  --spec examples/vulnerable-api-openapi.json \
+  --target http://localhost:8001 \
+  --auth-header x-api-token --auth-value alice-token \
+  --report-dir reports --formats json,markdown,html
+```
+
+`--no-llm` skips LLM-assisted generation even if a provider is
+configured; `--skip-methods DELETE` (comma-separated) excludes methods
+from fuzzing; run `python3 -m app.cli --help` for the full option list.
+
+`demo_llm_fuzz.py`, `demo_findings.py`, `demo_reporting.py`, and the CLI
+all run fully offline by default (`LLM_PROVIDER=fake` — a deterministic,
+endpoint-aware heuristic "model", no network, no API key). To use a real
+provider instead:
 
 ```bash
 export LLM_PROVIDER=openai_compatible
 export LLM_API_KEY=sk-...
 export LLM_MODEL=gpt-4o-mini                     # optional
 export LLM_BASE_URL=https://api.openai.com/v1    # optional — or OpenRouter / a local gateway
-python3 examples/demo_findings.py
+python3 examples/demo_reporting.py
 ```
 
 `OpenAICompatibleProvider` works unmodified against OpenAI itself,
@@ -191,13 +249,21 @@ OpenRouter, and most local model gateways (Ollama's OpenAI-compat mode,
 vLLM, etc.) — anything that speaks the standard `/chat/completions`
 shape.
 
-### 4. Run the test suite
+### 4. Open the report
+
+After `demo_reporting.py` or the CLI runs, open
+`reports/security-report.html` directly in a browser — no server
+needed. `reports/security-report.md` is the same content, formatted
+for pasting into an issue or PR; `reports/security-report.json` is the
+same content again, machine-readable.
+
+### 5. Run the test suite
 
 ```bash
 pytest -q
 ```
 
-281 tests, all passing, no real network access or API key required
+340 tests, all passing, no real network access or API key required
 anywhere (the LLM provider tests use `httpx.MockTransport`; the runner
 tests use a mix of in-process ASGI transport and a real local socket
 where timeout behavior genuinely requires one — see
@@ -264,11 +330,16 @@ app/
 ├── analyzer/     Phase 5 — response comparison, anomaly detection
 ├── generator/    Phase 6 — LLM-assisted test generation
 ├── rules/        Phase 7 — deterministic security rules, Finding model
+├── reports/      Phase 8 — JSON/Markdown/HTML report generation
+├── cli.py        Phase 8 — the project's one CLI entry point
 ├── core/         shared config (RunnerSettings)
 └── api/          the fuzzer's own thin FastAPI backend
 
 vulnerable-api/   intentionally vulnerable local test target
 examples/         one runnable, self-contained demo per phase
 tests/            pytest suite, one file per module + integration/e2e tests
-reports/          generated output (gitignored)
+reports/          generated output (gitignored) — note: same name as
+                  app/reports/ above but a different thing — that's
+                  the report-generation CODE, this is the report FILES
+AI_NOTES.md       where AI is used vs. trusted, with tests to back it up
 ```
